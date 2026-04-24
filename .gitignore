@@ -1,0 +1,34 @@
+# Secrets / env
+.env
+.env.local
+*.key
+
+# Personal documents (resumes, cover letters, letters of interest, etc.)
+*.docx
+*.doc
+*.pdf
+
+# Generated output (candidate-specific)
+*.xlsx
+*.xls
+jobs_full.json
+nashville_jobs_full.json
+jobs_list.txt
+evaluation_results.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
