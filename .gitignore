@@ -15,6 +15,7 @@ jobs_full.json
 nashville_jobs_full.json
 jobs_list.txt
 evaluation_results.txt
+*_scrape_cache.json
 
 # Python
 __pycache__/

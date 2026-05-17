@@ -22,6 +22,11 @@ import re
 import time
 import requests
 from bs4 import BeautifulSoup
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # ── USAJOBS credentials (from environment — see .env.example) ──────────────────
 USAJOBS_API_KEY = os.environ.get("USAJOBS_API_KEY", "")
@@ -924,48 +929,174 @@ def scrape_tva() -> list[dict]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Per-source cache  (nashville_scrape_cache.json)
+# Schema: { "Source Label": { "scraped_at": "<ISO datetime>", "jobs": [...] } }
+# ══════════════════════════════════════════════════════════════════════════════
+
+CACHE_FILE = "nashville_scrape_cache.json"
+CACHE_TTL_HOURS = 24
+
+
+def _load_cache() -> dict:
+    try:
+        with open(CACHE_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+
+    # No cache yet — bootstrap from nashville_jobs_full.json if it exists and is recent
+    from datetime import datetime, timezone
+    from collections import defaultdict
+    jobs_file = "nashville_jobs_full.json"
+    try:
+        mtime = os.path.getmtime(jobs_file)
+        scraped_at = datetime.fromtimestamp(mtime, tz=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - scraped_at).total_seconds() / 3600
+        if age_hours < CACHE_TTL_HOURS:
+            with open(jobs_file, encoding="utf-8") as f:
+                all_jobs = json.load(f)
+            by_source = defaultdict(list)
+            for job in all_jobs:
+                by_source[job["source"]].append(job)
+            # Map source label → cache key (must match keys used in main())
+            SOURCE_KEY_MAP = {
+                "Federal":           "Federal",
+                "Metro Nashville":   "Metro Nashville",
+                "City of Brentwood": "City of Brentwood",
+                "Williamson County": "Williamson County",
+                "MNPS":              "MNPS",
+                "TN State":          "TN State",
+                "BNA":               "BNA",
+                "WeGo":              "WeGo",
+                "THDA":              "THDA",
+                "City of Franklin":  "City of Franklin",
+            }
+            cache = {}
+            ts = scraped_at.isoformat()
+            for src_label, cache_key in SOURCE_KEY_MAP.items():
+                jobs = by_source.get(src_label, [])
+                cache[cache_key] = {"scraped_at": ts, "jobs": jobs}
+            print(f"[cache] Bootstrapped from {jobs_file} (scraped {int(age_hours * 60)}m ago).")
+            _save_cache(cache)
+            return cache
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        pass
+
+    return {}
+
+
+def _save_cache(cache: dict) -> None:
+    with open(CACHE_FILE, "w", encoding="utf-8") as f:
+        json.dump(cache, f, indent=2, ensure_ascii=False)
+
+
+def _cache_fresh(cache: dict, key: str) -> bool:
+    """Return True if key was cached within CACHE_TTL_HOURS."""
+    from datetime import datetime, timezone
+    entry = cache.get(key)
+    if not entry or "scraped_at" not in entry:
+        return False
+    scraped_at = datetime.fromisoformat(entry["scraped_at"])
+    age_hours = (datetime.now(timezone.utc) - scraped_at).total_seconds() / 3600
+    return age_hours < CACHE_TTL_HOURS
+
+
+def _cached_jobs(cache: dict, key: str) -> list:
+    from datetime import datetime, timezone
+    entry = cache[key]
+    scraped_at = datetime.fromisoformat(entry["scraped_at"])
+    age_minutes = int((datetime.now(timezone.utc) - scraped_at).total_seconds() / 60)
+    print(f"  [cache hit] {key} — {len(entry['jobs'])} jobs from {age_minutes}m ago, skipping scrape.")
+    return entry["jobs"]
+
+
+def _run_and_cache(cache: dict, key: str, scrape_fn) -> list:
+    from datetime import datetime, timezone
+    jobs = scrape_fn()
+    cache[key] = {
+        "scraped_at": datetime.now(timezone.utc).isoformat(),
+        "jobs": jobs,
+    }
+    _save_cache(cache)
+    return jobs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Main
 # ══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    cache = _load_cache()
     all_jobs = []
 
-    # Federal
-    all_jobs.extend(scrape_usajobs())
+    # Federal — re-scrape if cache is empty but credentials are now available
+    key = "Federal"
+    cached_empty = _cache_fresh(cache, key) and len(cache.get(key, {}).get("jobs", [])) == 0
+    has_creds = bool(USAJOBS_API_KEY and USAJOBS_EMAIL)
+    if _cache_fresh(cache, key) and not (cached_empty and has_creds):
+        all_jobs.extend(_cached_jobs(cache, key))
+    else:
+        all_jobs.extend(_run_and_cache(cache, key, scrape_usajobs))
 
     # NeoGov agencies (Metro Nashville + Brentwood)
     for slug, label in NEOGOV_AGENCIES:
-        all_jobs.extend(scrape_neogov(slug, label))
+        if _cache_fresh(cache, label):
+            all_jobs.extend(_cached_jobs(cache, label))
+        else:
+            all_jobs.extend(_run_and_cache(cache, label, lambda s=slug, l=label: scrape_neogov(s, l)))
 
-    # Verify Metro Nashville count with a second pass
+    # Verify Metro Nashville count with a second pass (skip if cached)
     metro_count = sum(1 for j in all_jobs if j["source"] == "Metro Nashville")
-    verify_count = verify_metro_nashville_count()
-    if abs(verify_count - metro_count) > 3:
-        print(f"[WARNING] Metro Nashville count mismatch: scraped {metro_count}, verification pass found {verify_count}. Re-running...")
-        all_jobs = [j for j in all_jobs if j["source"] != "Metro Nashville"]
-        all_jobs.extend(scrape_neogov("nashville", "Metro Nashville"))
-    else:
-        print(f"[Metro Nashville] Count verified: {metro_count} jobs (verification pass: {verify_count})")
+    if not _cache_fresh(cache, "Metro Nashville"):
+        verify_count = verify_metro_nashville_count()
+        if abs(verify_count - metro_count) > 3:
+            print(f"[WARNING] Metro Nashville count mismatch: scraped {metro_count}, verification pass found {verify_count}. Re-running...")
+            all_jobs = [j for j in all_jobs if j["source"] != "Metro Nashville"]
+            fresh = _run_and_cache(cache, "Metro Nashville", lambda: scrape_neogov("nashville", "Metro Nashville"))
+            all_jobs.extend(fresh)
+        else:
+            print(f"[Metro Nashville] Count verified: {metro_count} jobs (verification pass: {verify_count})")
 
     # Williamson County
-    all_jobs.extend(scrape_williamson_county())
+    key = "Williamson County"
+    if _cache_fresh(cache, key):
+        all_jobs.extend(_cached_jobs(cache, key))
+    else:
+        all_jobs.extend(_run_and_cache(cache, key, scrape_williamson_county))
 
     # MNPS
-    all_jobs.extend(scrape_mnps())
+    key = "MNPS"
+    if _cache_fresh(cache, key):
+        all_jobs.extend(_cached_jobs(cache, key))
+    else:
+        all_jobs.extend(_run_and_cache(cache, key, scrape_mnps))
 
     # TN State
-    all_jobs.extend(scrape_tn_state())
+    key = "TN State"
+    if _cache_fresh(cache, key):
+        all_jobs.extend(_cached_jobs(cache, key))
+    else:
+        all_jobs.extend(_run_and_cache(cache, key, scrape_tn_state))
 
-    # Manual-navigation sources (bot-protected — Chrome window will open for each)
-    print("\n" + "="*60)
-    print("MANUAL NAVIGATION SOURCES")
-    print("A Chrome window will open for each. If a bot challenge")
-    print("appears, click through it. Otherwise just watch.")
-    print("="*60 + "\n")
-    all_jobs.extend(scrape_bna())
-    all_jobs.extend(scrape_wego())
-    all_jobs.extend(scrape_thda())
-    all_jobs.extend(scrape_franklin())
+    # Manual-navigation / bot-protected sources
+    browser_sources = [
+        ("BNA",             scrape_bna),
+        ("WeGo",            scrape_wego),
+        ("THDA",            scrape_thda),
+        ("City of Franklin", scrape_franklin),
+    ]
+    needs_browser = [s for s, fn in browser_sources if not _cache_fresh(cache, s)]
+    if needs_browser:
+        print("\n" + "="*60)
+        print("MANUAL NAVIGATION SOURCES")
+        print("A Chrome window will open for each. If a bot challenge")
+        print("appears, click through it. Otherwise just watch.")
+        print("="*60 + "\n")
+    for src, fn in browser_sources:
+        if _cache_fresh(cache, src):
+            all_jobs.extend(_cached_jobs(cache, src))
+        else:
+            all_jobs.extend(_run_and_cache(cache, src, fn))
     # TVA removed — no Nashville-area openings
 
     print(f"\nTotal collected across all sources: {len(all_jobs)}")

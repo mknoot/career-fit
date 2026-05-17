@@ -17,6 +17,7 @@ Output: nashville_job_recommendations.xlsx
 
 import json
 import re
+from datetime import datetime
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -361,6 +362,10 @@ def write_yes_sheet(wb, sheet_name: str, group: list[dict]):
 
 
 def write_excel(results: list[dict], output_file: str = "nashville_job_recommendations.xlsx"):
+    run_dt = datetime.now()
+    timestamp = run_dt.strftime("%B %d, %Y  %I:%M %p")
+    dated_file = f"nashville_job_recommendations_{run_dt.strftime('%Y%m%d_%H%M')}.xlsx"
+
     wb = openpyxl.Workbook()
     wb.remove(wb.active)
 
@@ -379,10 +384,12 @@ def write_excel(results: list[dict], output_file: str = "nashville_job_recommend
     ws = wb.create_sheet(title="Summary")
     ws["A1"] = "Nashville Metro Government Jobs"
     ws["A1"].font = Font(bold=True, size=14)
+    ws["A2"] = f"Generated: {timestamp}"
+    ws["A2"].font = Font(italic=True, color="666666")
 
-    ws["A3"] = "Category"
-    ws["B3"] = "Count"
-    ws["A3"].font = ws["B3"].font = Font(bold=True)
+    ws["A4"] = "Category"
+    ws["B4"] = "Count"
+    ws["A4"].font = ws["B4"].font = Font(bold=True)
 
     rows = [
         ("YES - Recent postings",  len(yes_recent)),
@@ -401,7 +408,7 @@ def write_excel(results: list[dict], output_file: str = "nashville_job_recommend
     for src, n in sorted(source_counts.items()):
         rows.append((f"  YES from {src}", n))
 
-    for i, (label, count) in enumerate(rows, start=4):
+    for i, (label, count) in enumerate(rows, start=5):
         ws[f"A{i}"] = label
         ws[f"B{i}"] = count
 
@@ -416,7 +423,8 @@ def write_excel(results: list[dict], output_file: str = "nashville_job_recommend
         cell.fill = PatternFill(start_color=color, end_color=color, fill_type="solid")
 
     wb.save(output_file)
-    print(f"Saved {output_file}")
+    wb.save(dated_file)
+    print(f"Saved {output_file} and {dated_file}")
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
